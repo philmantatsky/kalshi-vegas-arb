@@ -137,8 +137,8 @@ def main() -> None:
                 epl_title_probs = get_epl_title_probs(force_refresh=(tick_count > 1))
                 log.info("EPL title probs refreshed: %d teams", len(epl_title_probs))
 
-            # Game odds refresh every 2 ticks (30 min, matches cache TTL)
-            if tick_count % 2 == 1:
+            # Game odds: refresh every 16 ticks (4h), same cadence as WC outrights
+            if tick_count % ODDS_REFRESH_TICKS == 1:
                 for sport in GAME_SPORTS:
                     gp = odds.get_game_probs(sport, force_refresh=True)
                     game_probs[sport] = gp

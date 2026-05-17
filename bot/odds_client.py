@@ -189,7 +189,7 @@ class OddsClient:
     # --- H2H game fair probabilities ------------------------------------------
 
     def get_game_probs(
-        self, sport_key: str, *, force_refresh: bool = False, ttl: float = 1800
+        self, sport_key: str, *, force_refresh: bool = False, ttl: float = CACHE_TTL_SEC
     ) -> dict[tuple[str, str], dict[str, float]]:
         """Returns {(home_lower, away_lower): {team_lower: vig_adj_fair_prob}}.
 
