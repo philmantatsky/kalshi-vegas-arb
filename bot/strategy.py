@@ -12,6 +12,7 @@ from bot.sizing import kelly_dollars, apply_caps, to_shares
 log = logging.getLogger("strategy")
 
 MAX_INTENTS_PER_TICK = 20
+MAX_OPEN_POSITIONS = 28  # server limit is 30; leave 2 slots buffer
 MIN_DOLLARS = 2.0  # don't bother submitting tiny orders
 
 
@@ -83,9 +84,15 @@ def decide_trades(
                 idempotency_key="",
             ))
 
+    open_positions = len(portfolio.positions)
+
     # --- Entry pass: find new edges ---
     for m in candidates.markets:
         if len(intents) >= MAX_INTENTS_PER_TICK:
+            break
+
+        # Server hard-caps at 30 open positions
+        if open_positions >= MAX_OPEN_POSITIONS:
             break
 
         # Skip if already holding this market (avoid adding to a position mid-convergence)
@@ -146,6 +153,7 @@ def decide_trades(
                 gross_usd += capped
                 market_usd[m.market_id] = cur_market_usd + capped
                 cash -= capped
+                open_positions += 1
 
         elif n_edge >= MIN_EDGE:
             no_ask = 1.0 - yes_bid
@@ -166,5 +174,6 @@ def decide_trades(
                 gross_usd += capped
                 market_usd[m.market_id] = cur_market_usd + capped
                 cash -= capped
+                open_positions += 1
 
     return intents
