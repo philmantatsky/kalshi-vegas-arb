@@ -42,7 +42,7 @@ log = logging.getLogger("bot")
 CONFIG: dict[str, Any] = {"strategy": "kalshi-vegas-arb", "version": "1.0"}
 CONFIG_HASH = hashlib.sha256(json.dumps(CONFIG, sort_keys=True).encode()).hexdigest()[:16]
 EXPERIMENT_SLUG = os.environ.get("EXPERIMENT_SLUG", "kalshi-vegas-arb-v1")
-N_TICKS = 96 * 14  # 14 days of 15-min ticks
+N_TICKS = 1500  # competition requirement: 1344 max ticks + buffer
 
 # Refresh Vegas odds every N ticks (16 ticks = 4 hours)
 ODDS_REFRESH_TICKS = 16
