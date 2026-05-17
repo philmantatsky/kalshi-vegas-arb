@@ -1,0 +1,14 @@
+.env
+bot.pid
+odds_cache.db
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+logs/
+*.log
+.DS_Store
+dist/
+build/
+*.egg-info/

@@ -1,0 +1,14 @@
+services:
+  bot:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./logs:/app/logs
+      - ./odds_cache.db:/app/odds_cache.db
+    healthcheck:
+      test: ["CMD", "find", "/app/logs", "-name", "bot.log", "-newer", "/app/logs/.last_check", "-print"]
+      interval: 5m
+      timeout: 10s
+      retries: 3
+      start_period: 30s
