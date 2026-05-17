@@ -2,3 +2,4 @@ ai-prophet-core
 python-dotenv
 tenacity
 requests
+anthropic

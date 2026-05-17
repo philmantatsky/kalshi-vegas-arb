@@ -18,6 +18,14 @@ CACHE_TTL_SEC = 4 * 3600  # refetch every 4h → ~84 req/14 days for 3 sport key
 
 SHARP_BOOKS = {"pinnacle", "draftkings", "fanduel", "betmgm", "bovada"}
 
+SPORT_DISPLAY: dict[str, str] = {
+    "basketball_nba": "NBA basketball",
+    "baseball_mlb": "MLB baseball",
+    "icehockey_nhl": "NHL hockey",
+    "soccer_epl": "English Premier League soccer",
+    "soccer_fifa_world_cup_winner": "FIFA World Cup 2026",
+}
+
 
 @dataclass
 class OddsBook:
@@ -82,6 +90,80 @@ class OddsClient:
         log.info("odds_api %s remaining=%s used=%s", path, remaining, used)
         return resp.json()
 
+    # --- LLM fallback (when Odds API quota exhausted) -------------------------
+
+    def _llm_game_probs(self, sport_key: str) -> dict[tuple[str, str], dict[str, float]]:
+        """Ask Claude haiku for current game fair probabilities when Odds API is down."""
+        try:
+            import anthropic
+            client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
+            sport_name = SPORT_DISPLAY.get(sport_key, sport_key)
+            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            msg = client.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=1500,
+                messages=[{
+                    "role": "user",
+                    "content": (
+                        f"Today is {today}. List all upcoming {sport_name} games in the next 48 hours "
+                        "with vig-adjusted fair win probabilities (sum to 1.0 per game, or 3 outcomes for soccer). "
+                        "Respond ONLY with valid JSON in this exact format, no other text:\n"
+                        '{"games": [{"home": "Team Name", "away": "Team Name", '
+                        '"probs": {"home team name": 0.60, "away team name": 0.40}}]}'
+                        "\nFor soccer add a draw key. Use full official team names, lowercase."
+                    ),
+                }],
+            )
+            raw = next(b.text for b in msg.content if b.type == "text").strip()  # type: ignore[union-attr]
+            # Strip markdown code fences if present
+            if raw.startswith("```"):
+                raw = raw.split("```")[1]
+                if raw.startswith("json"):
+                    raw = raw[4:]
+            data = json.loads(raw)
+            result: dict[tuple[str, str], dict[str, float]] = {}
+            for g in data.get("games", []):
+                home = g["home"].lower()
+                away = g["away"].lower()
+                result[(home, away)] = {k.lower(): v for k, v in g["probs"].items()}
+            log.info("LLM fallback %s: %d games", sport_key, len(result))
+            return result
+        except Exception as e:
+            log.error("LLM fallback failed for %s: %s", sport_key, e)
+            return {}
+
+    def _llm_wc_probs(self) -> dict[str, float]:
+        """Ask Claude haiku for World Cup winner probabilities."""
+        try:
+            import anthropic
+            client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
+            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            msg = client.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=1000,
+                messages=[{
+                    "role": "user",
+                    "content": (
+                        f"Today is {today}. Provide vig-adjusted fair probabilities for each team "
+                        "to win the FIFA World Cup 2026. Respond ONLY with valid JSON: "
+                        '{"country name lowercase": probability, ...} '
+                        "Probabilities must sum to 1.0. Include all 32 qualified teams."
+                    ),
+                }],
+            )
+            raw = next(b.text for b in msg.content if b.type == "text").strip()  # type: ignore[union-attr]
+            if raw.startswith("```"):
+                raw = raw.split("```")[1]
+                if raw.startswith("json"):
+                    raw = raw[4:]
+            data = json.loads(raw)
+            result = {k.lower(): float(v) for k, v in data.items() if isinstance(v, (int, float))}
+            log.info("LLM fallback WC: %d teams", len(result))
+            return result
+        except Exception as e:
+            log.error("LLM fallback WC failed: %s", e)
+            return {}
+
     # --- Discovery -------------------------------------------------------------
 
     def list_sports(self) -> list[dict]:
@@ -113,6 +195,9 @@ class OddsClient:
                 break
             except requests.HTTPError as e:
                 log.warning("WC fetch %s failed: %s", path, e)
+                if hasattr(e, "response") and e.response is not None and e.response.status_code in (401, 402, 429):
+                    log.warning("Odds API quota exhausted — falling back to LLM")
+                    return self._llm_wc_probs()
 
         if not raw:
             return {}
@@ -208,6 +293,16 @@ class OddsClient:
             )
         except requests.HTTPError as e:
             log.warning("game_probs %s failed: %s", sport_key, e)
+            if hasattr(e, "response") and e.response is not None and e.response.status_code in (401, 402, 429):
+                log.warning("Odds API quota exhausted — falling back to LLM for %s", sport_key)
+                return self._llm_game_probs(sport_key)
+            # For other errors, serve stale cache if available
+            stale = self._db.execute(
+                "SELECT data_json FROM odds_cache WHERE cache_key = ?", (cache_key,)
+            ).fetchone()
+            if stale:
+                log.warning("Serving stale cache for %s", sport_key)
+                return {(item["home"], item["away"]): item["probs"] for item in json.loads(stale[0])}
             return {}
 
         now_iso = datetime.now(timezone.utc).isoformat()
