@@ -92,35 +92,99 @@ class OddsClient:
 
     # --- LLM fallback (when Odds API quota exhausted) -------------------------
 
-    def _llm_game_probs(self, sport_key: str) -> dict[tuple[str, str], dict[str, float]]:
-        """Ask Claude haiku for current game fair probabilities when Odds API is down."""
-        try:
+    def _llm_call(self, prompt: str, max_tokens: int = 1500) -> str:
+        """Call Claude via Anthropic or OpenRouter depending on key prefix."""
+        api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+        if not api_key:
+            raise ValueError("ANTHROPIC_API_KEY not set")
+
+        if api_key.startswith("sk-or-"):
+            # OpenRouter — OpenAI-compatible endpoint
+            resp = requests.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                json={
+                    "model": "anthropic/claude-haiku-4-5",
+                    "max_tokens": max_tokens,
+                    "messages": [{"role": "user", "content": prompt}],
+                },
+                timeout=30,
+            )
+            resp.raise_for_status()
+            return resp.json()["choices"][0]["message"]["content"].strip()
+        else:
+            # Direct Anthropic API
             import anthropic
-            client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
-            sport_name = SPORT_DISPLAY.get(sport_key, sport_key)
-            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            client = anthropic.Anthropic(api_key=api_key)
             msg = client.messages.create(
                 model="claude-haiku-4-5-20251001",
-                max_tokens=1500,
-                messages=[{
-                    "role": "user",
-                    "content": (
-                        f"Today is {today}. List all upcoming {sport_name} games in the next 48 hours "
-                        "with vig-adjusted fair win probabilities (sum to 1.0 per game, or 3 outcomes for soccer). "
-                        "Respond ONLY with valid JSON in this exact format, no other text:\n"
-                        '{"games": [{"home": "Team Name", "away": "Team Name", '
-                        '"probs": {"home team name": 0.60, "away team name": 0.40}}]}'
-                        "\nFor soccer add a draw key. Use full official team names, lowercase."
-                    ),
-                }],
+                max_tokens=max_tokens,
+                messages=[{"role": "user", "content": prompt}],
             )
-            raw = next(b.text for b in msg.content if b.type == "text").strip()  # type: ignore[union-attr]
-            # Strip markdown code fences if present
-            if raw.startswith("```"):
-                raw = raw.split("```")[1]
-                if raw.startswith("json"):
-                    raw = raw[4:]
-            data = json.loads(raw)
+            return next(b.text for b in msg.content if b.type == "text").strip()  # type: ignore[union-attr]
+
+    def _parse_llm_json(self, raw: str) -> dict:
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+        return json.loads(raw.strip())
+
+    _ESPN_SPORT_MAP: dict[str, tuple[str, str]] = {
+        "basketball_nba": ("basketball", "nba"),
+        "baseball_mlb": ("baseball", "mlb"),
+        "icehockey_nhl": ("hockey", "nhl"),
+        "soccer_epl": ("soccer", "eng.1"),
+    }
+
+    def _espn_schedule(self, sport_key: str) -> list[tuple[str, str]]:
+        """Fetch upcoming game matchups from ESPN's free public scoreboard API."""
+        mapping = self._ESPN_SPORT_MAP.get(sport_key)
+        if not mapping:
+            return []
+        sport, league = mapping
+        try:
+            resp = requests.get(
+                f"https://site.api.espn.com/apis/site/v2/sports/{sport}/{league}/scoreboard",
+                timeout=10,
+            )
+            if resp.status_code != 200:
+                return []
+            games = []
+            for event in resp.json().get("events", []):
+                comp = (event.get("competitions") or [{}])[0]
+                teams = comp.get("competitors", [])
+                home = next((c["team"]["displayName"] for c in teams if c.get("homeAway") == "home"), None)
+                away = next((c["team"]["displayName"] for c in teams if c.get("homeAway") == "away"), None)
+                if home and away:
+                    games.append((home, away))
+            return games
+        except Exception as e:
+            log.warning("ESPN schedule fetch failed for %s: %s", sport_key, e)
+            return []
+
+    def _llm_game_probs(self, sport_key: str) -> dict[tuple[str, str], dict[str, float]]:
+        """Ask Claude for win probabilities on games fetched from ESPN schedule."""
+        try:
+            schedule = self._espn_schedule(sport_key)
+            if not schedule:
+                log.warning("LLM fallback: no ESPN schedule for %s", sport_key)
+                return {}
+
+            sport_name = SPORT_DISPLAY.get(sport_key, sport_key)
+            is_soccer = "soccer" in sport_key
+            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            games_list = "\n".join(f"- {away} (away) at {home} (home)" for home, away in schedule)
+            draw_note = " Include a 'draw' key for soccer." if is_soccer else ""
+            prompt = (
+                f"Today is {today}. For each {sport_name} game below, estimate vig-adjusted fair "
+                f"win probabilities (sum to 1.0 per game).{draw_note}\n\n"
+                f"Games:\n{games_list}\n\n"
+                "Respond ONLY with valid JSON, no other text:\n"
+                '{"games": [{"home": "exact home team name", "away": "exact away team name", '
+                '"probs": {"exact home name": 0.60, "exact away name": 0.40}}]}'
+            )
+            data = self._parse_llm_json(self._llm_call(prompt))
             result: dict[tuple[str, str], dict[str, float]] = {}
             for g in data.get("games", []):
                 home = g["home"].lower()
@@ -133,30 +197,16 @@ class OddsClient:
             return {}
 
     def _llm_wc_probs(self) -> dict[str, float]:
-        """Ask Claude haiku for World Cup winner probabilities."""
+        """Ask Claude for World Cup winner probabilities."""
         try:
-            import anthropic
-            client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
             today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-            msg = client.messages.create(
-                model="claude-haiku-4-5-20251001",
-                max_tokens=1000,
-                messages=[{
-                    "role": "user",
-                    "content": (
-                        f"Today is {today}. Provide vig-adjusted fair probabilities for each team "
-                        "to win the FIFA World Cup 2026. Respond ONLY with valid JSON: "
-                        '{"country name lowercase": probability, ...} '
-                        "Probabilities must sum to 1.0. Include all 32 qualified teams."
-                    ),
-                }],
+            prompt = (
+                f"Today is {today}. Provide vig-adjusted fair probabilities for each team "
+                "to win the FIFA World Cup 2026. Respond ONLY with valid JSON: "
+                '{"country name lowercase": probability, ...} '
+                "Probabilities must sum to 1.0. Include all 32 qualified teams."
             )
-            raw = next(b.text for b in msg.content if b.type == "text").strip()  # type: ignore[union-attr]
-            if raw.startswith("```"):
-                raw = raw.split("```")[1]
-                if raw.startswith("json"):
-                    raw = raw[4:]
-            data = json.loads(raw)
+            data = self._parse_llm_json(self._llm_call(prompt, max_tokens=1000))
             result = {k.lower(): float(v) for k, v in data.items() if isinstance(v, (int, float))}
             log.info("LLM fallback WC: %d teams", len(result))
             return result
