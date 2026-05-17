@@ -1,0 +1,13 @@
+app = "kalshi-vegas-arb"
+primary_region = "ord"
+
+[build]
+
+# Worker process — no HTTP service, no auto-scaling to zero
+[deploy]
+  strategy = "immediate"
+
+[[vm]]
+  cpu_kind = "shared"
+  cpus = 1
+  memory_mb = 256
