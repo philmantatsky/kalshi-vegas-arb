@@ -55,14 +55,14 @@ class OddsClient:
         db.commit()
         return db
 
-    def _cache_get(self, key: str) -> list[dict] | None:
+    def _cache_get(self, key: str, ttl: float = CACHE_TTL_SEC) -> list[dict] | None:
         row = self._db.execute(
             "SELECT fetched_at, data_json FROM odds_cache WHERE cache_key = ?", (key,)
         ).fetchone()
         if row is None:
             return None
         fetched_at, data_json = row
-        if time.time() - fetched_at > CACHE_TTL_SEC:
+        if time.time() - fetched_at > ttl:
             return None
         return json.loads(data_json)
 
@@ -186,7 +186,62 @@ class OddsClient:
         self._cache_set(CACHE_KEY, [{"name": k, "prob": v} for k, v in result.items()])
         return result
 
-    # --- H2H game events (NBA/MLB/etc, for future use) -------------------------
+    # --- H2H game fair probabilities ------------------------------------------
+
+    def get_game_probs(
+        self, sport_key: str, *, force_refresh: bool = False, ttl: float = 1800
+    ) -> dict[tuple[str, str], dict[str, float]]:
+        """Returns {(home_lower, away_lower): {team_lower: vig_adj_fair_prob}}.
+
+        Soccer includes a 'draw' key. TTL defaults to 30 min — game lines move.
+        """
+        cache_key = f"gprobs_{sport_key}"
+        if not force_refresh:
+            cached = self._cache_get(cache_key, ttl=ttl)
+            if cached is not None:
+                return {(item["home"], item["away"]): item["probs"] for item in cached}
+
+        try:
+            raw = self._get(
+                f"/sports/{sport_key}/odds/",
+                {"regions": "us", "markets": "h2h", "oddsFormat": "decimal", "dateFormat": "iso"},
+            )
+        except requests.HTTPError as e:
+            log.warning("game_probs %s failed: %s", sport_key, e)
+            return {}
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+        result: dict[tuple[str, str], dict[str, float]] = {}
+        for game in raw:
+            if game.get("commence_time", "") < now_iso:
+                continue
+            home = game["home_team"].lower()
+            away = game["away_team"].lower()
+            team_raw: dict[str, list[float]] = {}
+            for bm in game.get("bookmakers", []):
+                if bm.get("key") not in SHARP_BOOKS:
+                    continue
+                for mkt in bm.get("markets", []):
+                    if mkt.get("key") != "h2h":
+                        continue
+                    outcomes = [o for o in mkt.get("outcomes", []) if o.get("price", 0) > 1]
+                    if not outcomes:
+                        continue
+                    total = sum(1.0 / o["price"] for o in outcomes)
+                    for o in outcomes:
+                        fair = (1.0 / o["price"]) / total
+                        team_raw.setdefault(o["name"].lower(), []).append(fair)
+            if team_raw:
+                result[(home, away)] = {
+                    name: statistics.median(vals) for name, vals in team_raw.items()
+                }
+
+        serializable = [{"home": h, "away": a, "probs": p} for (h, a), p in result.items()]
+        self._cache_set(cache_key, serializable)
+        log.info("game_probs %s loaded: %d games", sport_key, len(result))
+        return result
+
+    # --- H2H game events (NBA/MLB/etc, legacy) --------------------------------
 
     def get_events(self, sport: str, *, force_refresh: bool = False) -> list[VegasEvent]:
         if not force_refresh:

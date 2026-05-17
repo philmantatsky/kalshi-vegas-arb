@@ -76,6 +76,15 @@ def main() -> None:
         epl_title_probs = get_epl_title_probs()
         log.info("EPL title probs (standings-based): %d teams", len(epl_title_probs))
 
+        # Game markets: NBA/MLB/NHL/EPL (h2h moneylines, 30-min cache)
+        GAME_SPORTS = ["basketball_nba", "baseball_mlb", "icehockey_nhl", "soccer_epl"]
+        game_probs: dict = {}
+        for sport in GAME_SPORTS:
+            gp = odds.get_game_probs(sport)
+            game_probs[sport] = gp
+        log.info("Game probs loaded: %d sports, %d total games",
+                 len(game_probs), sum(len(v) for v in game_probs.values()))
+
         tick_count = 0
         while True:
             lease = session.claim_tick()
@@ -118,7 +127,7 @@ def main() -> None:
                 for topic, ids in sorted(by_topic.items(), key=lambda x: -len(x[1])):
                     log.info("  %-30s %d markets  e.g. %s", topic, len(ids), ids[0])
 
-            # Periodic odds refresh
+            # Periodic odds refresh (WC outrights every 4h)
             if tick_count % ODDS_REFRESH_TICKS == 1:
                 wc_odds = odds.get_world_cup_outrights()
                 log.info("WC odds refreshed: %d teams", len(wc_odds))
@@ -128,8 +137,18 @@ def main() -> None:
                 epl_title_probs = get_epl_title_probs(force_refresh=(tick_count > 1))
                 log.info("EPL title probs refreshed: %d teams", len(epl_title_probs))
 
+            # Game odds refresh every 2 ticks (30 min, matches cache TTL)
+            if tick_count % 2 == 1:
+                for sport in GAME_SPORTS:
+                    gp = odds.get_game_probs(sport, force_refresh=True)
+                    game_probs[sport] = gp
+                log.info("Game probs refreshed: %d total games",
+                         sum(len(v) for v in game_probs.values()))
+
             # Decide trades
-            intents = decide_trades(candidates, portfolio, wc_odds, epl_odds, epl_title_probs) if (candidates and portfolio) else []
+            intents = decide_trades(
+                candidates, portfolio, wc_odds, epl_odds, epl_title_probs, game_probs
+            ) if (candidates and portfolio) else []
 
             plan: dict[str, Any] = {
                 "reasoning": "kalshi-vegas-arb",

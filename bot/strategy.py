@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from ai_prophet_core import TradeIntentRequest
 from ai_prophet_core.client_models import CandidatesResponse, PortfolioResponse
 
-from bot.market_matcher import match_world_cup, match_epl
+from bot.market_matcher import match_world_cup, match_epl, match_game_market
 from bot.edge import is_liquid, yes_edge, no_edge, MIN_EDGE, MIN_MINUTES
 from bot.sizing import kelly_dollars, apply_caps, to_shares
 
@@ -21,6 +21,7 @@ def decide_trades(
     wc_odds: dict[str, float],
     epl_odds: dict[str, float] | None = None,
     epl_title_probs: dict[str, float] | None = None,
+    game_probs: dict | None = None,
 ) -> list[TradeIntentRequest]:
     now = datetime.now(timezone.utc)
     cash = float(portfolio.cash)
@@ -48,7 +49,11 @@ def decide_trades(
         mid = pos.market_id
         vegas_prob = match_epl(mid, epl_odds or {})
         if vegas_prob is None:
+            vegas_prob = match_epl(mid, epl_title_probs or {})
+        if vegas_prob is None:
             vegas_prob = match_world_cup(mid, wc_odds)
+        if vegas_prob is None and game_probs:
+            vegas_prob = match_game_market(mid, game_probs)
         if vegas_prob is None:
             continue
 
@@ -101,13 +106,14 @@ def decide_trades(
         if not is_liquid(yes_bid, yes_ask):
             continue
 
-        # EPL markets settle before May 31 — prioritise them
-        # Try The Odds API EPL odds first, then ESPN standings-based probs, then WC
+        # Priority: EPL title (ESPN/Odds API) → WC outrights → game markets
         vegas_prob = match_epl(m.market_id, epl_odds or {})
         if vegas_prob is None and epl_title_probs:
             vegas_prob = match_epl(m.market_id, epl_title_probs)
         if vegas_prob is None:
             vegas_prob = match_world_cup(m.market_id, wc_odds)
+        if vegas_prob is None and game_probs:
+            vegas_prob = match_game_market(m.market_id, game_probs)
         if vegas_prob is None:
             continue
 
